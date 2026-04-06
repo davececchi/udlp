@@ -1,0 +1,15 @@
+command: ['python', 'app.py']
+env:
+  - name: 'DATABRICKS_ACCOUNT_ID'
+    value: ''                          # Set this to your Databricks account ID
+  - name: 'DATABRICKS_ACCOUNT_HOST'
+    value: 'https://accounts.azuredatabricks.net'
+  - name: 'ACCOUNT_SP_CLIENT_ID'
+    valueFrom: 'account-sp-client-id'  # Databricks secret resource
+  - name: 'ACCOUNT_SP_CLIENT_SECRET'
+    valueFrom: 'account-sp-secret'     # Databricks secret resource
+  # Optional policy enforcement
+  # - name: 'ALLOWED_WORKSPACES'
+  #   value: '1234567890,9876543210'   # Comma-separated workspace IDs
+  # - name: 'ALLOWED_GROUP_PATTERN'
+  #   value: '^(ENTRA|AAD)-.*'         # Regex for allowed group names
