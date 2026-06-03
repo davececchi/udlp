@@ -32,6 +32,7 @@ WORKSPACE_ID=""
 DAYS=14
 DATABRICKS_APP_ID=""
 OUTPUT_FILE=""
+SCRIPT_VERSION="1.1.0"
 
 usage() {
   cat <<EOF
@@ -113,23 +114,81 @@ fi
 
 # --- Helpers ---
 
-# az rest -> Graph; tolerate failures (returns "null") so the run continues
+# Errors are appended (one JSON object per line) to a temp file rather than a
+# shell variable, because each call below runs in a $(...) subshell — a global
+# var mutated inside a subshell would not survive. The file does.
+ERR_FILE="$(mktemp)"
+trap 'rm -f "$ERR_FILE"' EXIT
+
+record_error() {
+  local section="$1" detail="$2"
+  jq -cn --arg s "$section" --arg d "$detail" '{section: $s, error: $d}' >> "$ERR_FILE"
+}
+
+# az rest -> Graph. On failure records the error and returns "null", so the run
+# continues AND a later reader can tell a failed/denied call apart from a real
+# empty result (which stays a populated object).
 graph_get() {
-  local url="$1"
-  local version="${2:-v1.0}"
-  local out err
-  out=$(az rest --method GET --url "https://graph.microsoft.com/${version}/${url}" 2>/dev/null) || out="null"
+  local section="$1" url="$2" version="${3:-v1.0}"
+  local out errf rc=0
+  errf="$(mktemp)"
+  out=$(az rest --method GET --url "https://graph.microsoft.com/${version}/${url}" 2>"$errf") || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    record_error "$section" "$(tr '\n' ' ' < "$errf" | cut -c1-500)"
+    rm -f "$errf"; echo "null"; return
+  fi
+  rm -f "$errf"
   [[ -z "$out" ]] && out="null"
   echo "$out"
 }
 
+# az rest -> Graph collection, following @odata.nextLink to merge every page.
+# Returns {value: [...all pages...]}. Use for any list that can exceed 100 rows
+# (group members, memberOf, transitiveMemberOf) so the saved bundle isn't
+# silently truncated.
+graph_get_all() {
+  local section="$1" url="$2" version="${3:-v1.0}"
+  local next="https://graph.microsoft.com/${version}/${url}"
+  local merged='[]' page errf rc guard=0
+  while [[ -n "$next" && "$next" != "null" ]]; do
+    guard=$((guard + 1))
+    if [[ "$guard" -gt 50 ]]; then
+      record_error "$section" "pagination stopped after 50 pages (possible runaway)"
+      break
+    fi
+    rc=0; errf="$(mktemp)"
+    page=$(az rest --method GET --url "$next" 2>"$errf") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      record_error "$section" "$(tr '\n' ' ' < "$errf" | cut -c1-500)"
+      rm -f "$errf"; break
+    fi
+    rm -f "$errf"
+    merged=$(jq -n --argjson acc "$merged" --argjson pg "${page:-null}" '$acc + (($pg.value) // [])')
+    next=$(echo "$page" | jq -r '."@odata.nextLink" // empty')
+  done
+  jq -n --argjson v "$merged" '{value: $v}'
+}
+
+# Databricks account REST. curl -sS does not fail on HTTP 4xx/5xx, so we capture
+# the status code via -w and record any >=400 as an error while still returning
+# "null" for the data (keeps "null = no usable data, see .errors" consistent).
 dbrest() {
-  local path="$1"
-  local resp
-  resp=$(curl -sS -H "Authorization: Bearer $DB_TOKEN" \
-    "${DB_HOST}/api/2.0/accounts/${ACCOUNT_ID}/${path}" 2>/dev/null) || resp="null"
-  [[ -z "$resp" ]] && resp="null"
-  echo "$resp"
+  local section="$1" path="$2"
+  local raw rc=0 code body
+  raw=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $DB_TOKEN" \
+    "${DB_HOST}/api/2.0/accounts/${ACCOUNT_ID}/${path}" 2>/dev/null) || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    record_error "$section" "curl transport error (rc=$rc)"
+    echo "null"; return
+  fi
+  code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  [[ -z "$body" ]] && body="null"
+  if [[ "$code" =~ ^[0-9]+$ ]] && [[ "$code" -ge 400 ]]; then
+    record_error "$section" "HTTP $code: $(echo "$body" | tr '\n' ' ' | cut -c1-300)"
+    echo "null"; return
+  fi
+  echo "$body"
 }
 
 # Lookback window for sign-in logs
@@ -152,7 +211,7 @@ echo ""
 # --- Azure side ---
 
 echo "[1/9] Resolving user in Entra..."
-user_obj=$(graph_get "users/${USER_UPN}?\$select=id,userPrincipalName,displayName,mail,accountEnabled,signInActivity,onPremisesSyncEnabled")
+user_obj=$(graph_get "user" "users/${USER_UPN}?\$select=id,userPrincipalName,displayName,mail,accountEnabled,signInActivity,onPremisesSyncEnabled")
 USER_OID=$(echo "$user_obj" | jq -r '.id // empty')
 if [[ -z "$USER_OID" ]]; then
   echo "  ERROR: User '$USER_UPN' not found in Entra." >&2
@@ -161,27 +220,27 @@ fi
 echo "        OID: $USER_OID"
 
 echo "[2/9] Resolving group in Entra..."
-group_obj=$(graph_get "groups/${GROUP_ID}?\$select=id,displayName,description,securityEnabled,mailEnabled,onPremisesSyncEnabled,membershipRule,membershipRuleProcessingState")
+group_obj=$(graph_get "group" "groups/${GROUP_ID}?\$select=id,displayName,description,securityEnabled,mailEnabled,onPremisesSyncEnabled,membershipRule,membershipRuleProcessingState")
 GROUP_NAME=$(echo "$group_obj" | jq -r '.displayName // "unknown"')
 echo "        Group: $GROUP_NAME"
 
 echo "[3/9] Direct + transitive group memberships for user..."
-user_memberOf=$(graph_get "users/${USER_OID}/memberOf?\$select=id,displayName")
-user_transitiveMemberOf=$(graph_get "users/${USER_OID}/transitiveMemberOf?\$select=id,displayName")
+user_memberOf=$(graph_get_all "user_memberOf" "users/${USER_OID}/memberOf?\$select=id,displayName")
+user_transitiveMemberOf=$(graph_get_all "user_transitiveMemberOf" "users/${USER_OID}/transitiveMemberOf?\$select=id,displayName")
 
 echo "[4/9] Current members of suspect group..."
-group_members=$(graph_get "groups/${GROUP_ID}/members?\$select=id,userPrincipalName,displayName")
+group_members=$(graph_get_all "group_members" "groups/${GROUP_ID}/members?\$select=id,userPrincipalName,displayName")
 USER_IS_MEMBER=$(echo "$group_members" | jq --arg uid "$USER_OID" '[.value[]? | select(.id == $uid)] | length > 0')
 
 # Also check transitively (group could be reached via nested membership)
 USER_IS_TRANSITIVE_MEMBER=$(echo "$user_transitiveMemberOf" | jq --arg gid "$GROUP_ID" '[.value[]? | select(.id == $gid)] | length > 0')
 
 echo "[5/9] PIM eligibility schedules (user x group)..."
-pim_eligibility=$(graph_get "identityGovernance/privilegedAccess/group/eligibilitySchedules?\$filter=principalId%20eq%20'${USER_OID}'%20and%20groupId%20eq%20'${GROUP_ID}'")
+pim_eligibility=$(graph_get "pim_eligibility" "identityGovernance/privilegedAccess/group/eligibilitySchedules?\$filter=principalId%20eq%20'${USER_OID}'%20and%20groupId%20eq%20'${GROUP_ID}'")
 
 echo "[6/9] PIM active assignment schedules + currently-active instances..."
-pim_assignment_schedules=$(graph_get "identityGovernance/privilegedAccess/group/assignmentSchedules?\$filter=principalId%20eq%20'${USER_OID}'%20and%20groupId%20eq%20'${GROUP_ID}'")
-pim_assignment_instances=$(graph_get "identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=principalId%20eq%20'${USER_OID}'%20and%20groupId%20eq%20'${GROUP_ID}'")
+pim_assignment_schedules=$(graph_get "pim_assignment_schedules" "identityGovernance/privilegedAccess/group/assignmentSchedules?\$filter=principalId%20eq%20'${USER_OID}'%20and%20groupId%20eq%20'${GROUP_ID}'")
+pim_assignment_instances=$(graph_get "pim_assignment_instances" "identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=principalId%20eq%20'${USER_OID}'%20and%20groupId%20eq%20'${GROUP_ID}'")
 
 ACTIVE_ACTIVATION=$(echo "$pim_assignment_instances" | jq --arg now "$NOW_ISO" \
   '[.value[]? | select((.startDateTime // "0000") <= $now) | select((.endDateTime // "9999") > $now)] | length > 0')
@@ -191,11 +250,11 @@ signin_filter="userId%20eq%20'${USER_OID}'%20and%20createdDateTime%20ge%20${SINC
 if [[ -n "$DATABRICKS_APP_ID" ]]; then
   signin_filter="${signin_filter}%20and%20appId%20eq%20'${DATABRICKS_APP_ID}'"
 fi
-signins=$(graph_get "auditLogs/signIns?\$filter=${signin_filter}&\$top=50&\$select=createdDateTime,appDisplayName,appId,clientAppUsed,status,ipAddress")
+signins=$(graph_get "signins" "auditLogs/signIns?\$filter=${signin_filter}&\$top=50&\$select=createdDateTime,appDisplayName,appId,clientAppUsed,status,ipAddress")
 
 echo "[8/9] PIM activation audit events for this user x group (last ${DAYS}d)..."
 audit_filter="category%20eq%20'RoleManagement'%20and%20activityDateTime%20ge%20${SINCE}"
-pim_audit=$(graph_get "auditLogs/directoryAudits?\$filter=${audit_filter}&\$top=100" "v1.0")
+pim_audit=$(graph_get "pim_audit" "auditLogs/directoryAudits?\$filter=${audit_filter}&\$top=100" "v1.0")
 pim_audit_filtered=$(echo "$pim_audit" | jq --arg uid "$USER_OID" --arg gid "$GROUP_ID" '
   {value: [(.value // [])[] | select(
     (.targetResources // [])[]? |
@@ -207,24 +266,24 @@ pim_audit_filtered=$(echo "$pim_audit" | jq --arg uid "$USER_OID" --arg gid "$GR
 
 echo "[9/9] Querying Databricks account (SCIM v2)..."
 
-db_user=$(dbrest "scim/v2/Users?filter=userName%20eq%20%22${USER_UPN}%22")
+db_user=$(dbrest "databricks_user_lookup" "scim/v2/Users?filter=userName%20eq%20%22${USER_UPN}%22")
 DB_USER_ID=$(echo "$db_user" | jq -r '.Resources[0].id // empty')
 if [[ -z "$DB_USER_ID" ]]; then
   # fallback: filter by externalId == Entra OID
-  db_user=$(dbrest "scim/v2/Users?filter=externalId%20eq%20%22${USER_OID}%22")
+  db_user=$(dbrest "databricks_user_lookup_by_externalid" "scim/v2/Users?filter=externalId%20eq%20%22${USER_OID}%22")
   DB_USER_ID=$(echo "$db_user" | jq -r '.Resources[0].id // empty')
 fi
 
 if [[ -n "$DB_USER_ID" ]]; then
-  db_user_detail=$(dbrest "scim/v2/Users/${DB_USER_ID}")
+  db_user_detail=$(dbrest "databricks_user_detail" "scim/v2/Users/${DB_USER_ID}")
 else
   db_user_detail="null"
 fi
 
-db_group=$(dbrest "scim/v2/Groups?filter=externalId%20eq%20%22${GROUP_ID}%22")
+db_group=$(dbrest "databricks_group_lookup" "scim/v2/Groups?filter=externalId%20eq%20%22${GROUP_ID}%22")
 DB_GROUP_ID=$(echo "$db_group" | jq -r '.Resources[0].id // empty')
 if [[ -n "$DB_GROUP_ID" ]]; then
-  db_group_detail=$(dbrest "scim/v2/Groups/${DB_GROUP_ID}")
+  db_group_detail=$(dbrest "databricks_group_detail" "scim/v2/Groups/${DB_GROUP_ID}")
 else
   db_group_detail="null"
 fi
@@ -242,13 +301,17 @@ fi
 
 db_workspace_assignment="null"
 if [[ -n "$WORKSPACE_ID" ]]; then
-  db_workspace_assignment=$(dbrest "workspaces/${WORKSPACE_ID}/permissionassignments")
+  db_workspace_assignment=$(dbrest "databricks_workspace_assignment" "workspaces/${WORKSPACE_ID}/permissionassignments")
 fi
 
 # --- Build output ---
 
+ERRORS=$(jq -cs '.' "$ERR_FILE" 2>/dev/null); [[ -z "$ERRORS" ]] && ERRORS='[]'
+
 out=$(jq -n \
   --arg ts "$NOW_ISO" \
+  --arg script_version "$SCRIPT_VERSION" \
+  --argjson errors "$ERRORS" \
   --arg tenant "$TENANT_ID" \
   --arg user_upn "$USER_UPN" \
   --arg user_oid "$USER_OID" \
@@ -277,6 +340,8 @@ out=$(jq -n \
   --argjson dbUserListsGroup "$DB_USER_LISTS_GROUP" \
   '{
     collected_at: $ts,
+    script_version: $script_version,
+    errors: $errors,
     inputs: {
       tenant_id: $tenant,
       user_upn: $user_upn,
@@ -359,6 +424,13 @@ else
   echo "    - Their browser session is stale; have them fully sign out and sign in."
   echo "    - Check the recent_signins block for prior activations during this session."
 fi
+ERR_COUNT=$(echo "$ERRORS" | jq 'length')
+if [[ "$ERR_COUNT" -gt 0 ]]; then
+  echo ""
+  echo "NOTE: $ERR_COUNT data-collection error(s) recorded in the bundle (see .errors)."
+  echo "      A 'null' section may mean a failed/denied call, not a real absence."
+fi
+
 echo ""
 echo "Full JSON saved to: $OUTPUT_FILE"
 echo "Attach this file when escalating to Databricks support."

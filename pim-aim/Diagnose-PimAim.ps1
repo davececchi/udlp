@@ -75,6 +75,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ScriptVersion = "1.1.0"
 
 if (-not $AccountId) {
     Write-Error "-AccountId is required (or set DATABRICKS_ACCOUNT_ID)."
@@ -117,27 +118,92 @@ if (-not $DbToken) {
 
 # --- Helpers ---
 
+# Records data-collection failures so a later reader can tell a failed/denied
+# call apart from a genuine empty result (which stays a populated object).
+$CollectionErrors = [System.Collections.Generic.List[object]]::new()
+
+function Add-CollectionError {
+    param([string]$Section, [string]$Detail)
+    $msg = (($Detail | Out-String) -replace '\s+', ' ').Trim()
+    if ($msg.Length -gt 500) { $msg = $msg.Substring(0, 500) }
+    $CollectionErrors.Add([ordered]@{ section = $Section; error = $msg }) | Out-Null
+}
+
 function Invoke-Graph {
     param(
+        [string]$Section,
         [string]$Url,
         [string]$Version = "v1.0"
     )
     $full = "https://graph.microsoft.com/$Version/$Url"
-    $raw = az rest --method GET --url $full 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $raw) {
+    $errFile = New-TemporaryFile
+    $raw = az rest --method GET --url $full 2>$errFile.FullName
+    if ($LASTEXITCODE -ne 0) {
+        Add-CollectionError $Section (Get-Content $errFile.FullName -Raw)
+        Remove-Item $errFile -Force
         return $null
     }
-    try { return $raw | ConvertFrom-Json -Depth 20 } catch { return $null }
+    Remove-Item $errFile -Force
+    if (-not $raw) { return $null }
+    try { return $raw | ConvertFrom-Json -Depth 20 } catch {
+        Add-CollectionError $Section "JSON parse failure"
+        return $null
+    }
 }
 
+# Graph collection that follows @odata.nextLink to merge every page. Returns an
+# object with a .value array of all rows, so the saved bundle isn't silently
+# truncated at 100 for large groups / heavily-grouped users.
+function Invoke-GraphAll {
+    param(
+        [string]$Section,
+        [string]$Url,
+        [string]$Version = "v1.0"
+    )
+    $next = "https://graph.microsoft.com/$Version/$Url"
+    $items = [System.Collections.Generic.List[object]]::new()
+    $guard = 0
+    while ($next) {
+        $guard++
+        if ($guard -gt 50) {
+            Add-CollectionError $Section "pagination stopped after 50 pages (possible runaway)"
+            break
+        }
+        $errFile = New-TemporaryFile
+        $raw = az rest --method GET --url $next 2>$errFile.FullName
+        if ($LASTEXITCODE -ne 0) {
+            Add-CollectionError $Section (Get-Content $errFile.FullName -Raw)
+            Remove-Item $errFile -Force
+            break
+        }
+        Remove-Item $errFile -Force
+        $page = $null
+        try { $page = $raw | ConvertFrom-Json -Depth 20 } catch {
+            Add-CollectionError $Section "JSON parse failure"
+            break
+        }
+        if ($page.value) { foreach ($v in $page.value) { $items.Add($v) } }
+        $next = $page.'@odata.nextLink'
+    }
+    return [pscustomobject]@{ value = $items.ToArray() }
+}
+
+# Databricks account REST. Invoke-RestMethod throws on HTTP 4xx/5xx; we capture
+# the status + body as a recorded error and return $null, keeping the bundle's
+# "null = no usable data, see .errors" contract consistent.
 function Invoke-DbRest {
-    param([string]$Path)
+    param([string]$Section, [string]$Path)
     try {
         return Invoke-RestMethod -Method GET `
             -Uri "$DbHost/api/2.0/accounts/$AccountId/$Path" `
             -Headers @{ Authorization = "Bearer $DbToken" } `
             -ErrorAction Stop
     } catch {
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+        $detail = $_.ErrorDetails.Message
+        if (-not $detail) { $detail = $_.Exception.Message }
+        Add-CollectionError $Section ("HTTP $code`: $detail")
         return $null
     }
 }
@@ -157,7 +223,7 @@ Write-Host ""
 # --- Azure side ---
 
 Write-Host "[1/9] Resolving user in Entra..."
-$userObj = Invoke-Graph "users/$User`?`$select=id,userPrincipalName,displayName,mail,accountEnabled,signInActivity,onPremisesSyncEnabled"
+$userObj = Invoke-Graph "user" "users/$User`?`$select=id,userPrincipalName,displayName,mail,accountEnabled,signInActivity,onPremisesSyncEnabled"
 $UserOid = $userObj.id
 if (-not $UserOid) {
     Write-Error "User '$User' not found in Entra."
@@ -165,25 +231,25 @@ if (-not $UserOid) {
 Write-Host "        OID: $UserOid"
 
 Write-Host "[2/9] Resolving group in Entra..."
-$groupObj = Invoke-Graph "groups/$GroupId`?`$select=id,displayName,description,securityEnabled,mailEnabled,onPremisesSyncEnabled,membershipRule,membershipRuleProcessingState"
+$groupObj = Invoke-Graph "group" "groups/$GroupId`?`$select=id,displayName,description,securityEnabled,mailEnabled,onPremisesSyncEnabled,membershipRule,membershipRuleProcessingState"
 $GroupName = if ($groupObj.displayName) { $groupObj.displayName } else { "unknown" }
 Write-Host "        Group: $GroupName"
 
 Write-Host "[3/9] Direct + transitive group memberships for user..."
-$userMemberOf = Invoke-Graph "users/$UserOid/memberOf`?`$select=id,displayName"
-$userTransitiveMemberOf = Invoke-Graph "users/$UserOid/transitiveMemberOf`?`$select=id,displayName"
+$userMemberOf = Invoke-GraphAll "user_memberOf" "users/$UserOid/memberOf`?`$select=id,displayName"
+$userTransitiveMemberOf = Invoke-GraphAll "user_transitiveMemberOf" "users/$UserOid/transitiveMemberOf`?`$select=id,displayName"
 
 Write-Host "[4/9] Current members of suspect group..."
-$groupMembers = Invoke-Graph "groups/$GroupId/members`?`$select=id,userPrincipalName,displayName"
+$groupMembers = Invoke-GraphAll "group_members" "groups/$GroupId/members`?`$select=id,userPrincipalName,displayName"
 $UserIsMember = [bool](($groupMembers.value | Where-Object { $_.id -eq $UserOid }).Count)
 $UserIsTransitiveMember = [bool](($userTransitiveMemberOf.value | Where-Object { $_.id -eq $GroupId }).Count)
 
 Write-Host "[5/9] PIM eligibility schedules (user x group)..."
-$pimEligibility = Invoke-Graph "identityGovernance/privilegedAccess/group/eligibilitySchedules`?`$filter=principalId%20eq%20'$UserOid'%20and%20groupId%20eq%20'$GroupId'"
+$pimEligibility = Invoke-Graph "pim_eligibility" "identityGovernance/privilegedAccess/group/eligibilitySchedules`?`$filter=principalId%20eq%20'$UserOid'%20and%20groupId%20eq%20'$GroupId'"
 
 Write-Host "[6/9] PIM active assignment schedules + currently-active instances..."
-$pimAssignmentSchedules = Invoke-Graph "identityGovernance/privilegedAccess/group/assignmentSchedules`?`$filter=principalId%20eq%20'$UserOid'%20and%20groupId%20eq%20'$GroupId'"
-$pimAssignmentInstances = Invoke-Graph "identityGovernance/privilegedAccess/group/assignmentScheduleInstances`?`$filter=principalId%20eq%20'$UserOid'%20and%20groupId%20eq%20'$GroupId'"
+$pimAssignmentSchedules = Invoke-Graph "pim_assignment_schedules" "identityGovernance/privilegedAccess/group/assignmentSchedules`?`$filter=principalId%20eq%20'$UserOid'%20and%20groupId%20eq%20'$GroupId'"
+$pimAssignmentInstances = Invoke-Graph "pim_assignment_instances" "identityGovernance/privilegedAccess/group/assignmentScheduleInstances`?`$filter=principalId%20eq%20'$UserOid'%20and%20groupId%20eq%20'$GroupId'"
 
 $ActiveActivation = $false
 if ($pimAssignmentInstances.value) {
@@ -199,11 +265,11 @@ $signinFilter = "userId%20eq%20'$UserOid'%20and%20createdDateTime%20ge%20$sinceI
 if ($DatabricksAppId) {
     $signinFilter += "%20and%20appId%20eq%20'$DatabricksAppId'"
 }
-$signins = Invoke-Graph "auditLogs/signIns`?`$filter=$signinFilter&`$top=50&`$select=createdDateTime,appDisplayName,appId,clientAppUsed,status,ipAddress"
+$signins = Invoke-Graph "signins" "auditLogs/signIns`?`$filter=$signinFilter&`$top=50&`$select=createdDateTime,appDisplayName,appId,clientAppUsed,status,ipAddress"
 
 Write-Host "[8/9] PIM activation audit events for this user x group (last $Days d)..."
 $auditFilter = "category%20eq%20'RoleManagement'%20and%20activityDateTime%20ge%20$sinceIso"
-$pimAudit = Invoke-Graph "auditLogs/directoryAudits`?`$filter=$auditFilter&`$top=100"
+$pimAudit = Invoke-Graph "pim_audit" "auditLogs/directoryAudits`?`$filter=$auditFilter&`$top=100"
 $pimAuditFiltered = @{ value = @() }
 if ($pimAudit.value) {
     $pimAuditFiltered.value = @($pimAudit.value | Where-Object {
@@ -217,18 +283,18 @@ if ($pimAudit.value) {
 Write-Host "[9/9] Querying Databricks account (SCIM v2)..."
 
 $encodedUpn = [System.Net.WebUtility]::UrlEncode($User)
-$dbUser = Invoke-DbRest "scim/v2/Users?filter=userName%20eq%20%22$encodedUpn%22"
+$dbUser = Invoke-DbRest "databricks_user_lookup" "scim/v2/Users?filter=userName%20eq%20%22$encodedUpn%22"
 $DbUserId = $dbUser.Resources[0].id
 if (-not $DbUserId) {
-    $dbUser = Invoke-DbRest "scim/v2/Users?filter=externalId%20eq%20%22$UserOid%22"
+    $dbUser = Invoke-DbRest "databricks_user_lookup_by_externalid" "scim/v2/Users?filter=externalId%20eq%20%22$UserOid%22"
     $DbUserId = $dbUser.Resources[0].id
 }
 
-$dbUserDetail = if ($DbUserId) { Invoke-DbRest "scim/v2/Users/$DbUserId" } else { $null }
+$dbUserDetail = if ($DbUserId) { Invoke-DbRest "databricks_user_detail" "scim/v2/Users/$DbUserId" } else { $null }
 
-$dbGroup = Invoke-DbRest "scim/v2/Groups?filter=externalId%20eq%20%22$GroupId%22"
+$dbGroup = Invoke-DbRest "databricks_group_lookup" "scim/v2/Groups?filter=externalId%20eq%20%22$GroupId%22"
 $DbGroupId = $dbGroup.Resources[0].id
-$dbGroupDetail = if ($DbGroupId) { Invoke-DbRest "scim/v2/Groups/$DbGroupId" } else { $null }
+$dbGroupDetail = if ($DbGroupId) { Invoke-DbRest "databricks_group_detail" "scim/v2/Groups/$DbGroupId" } else { $null }
 
 $DbUserInGroup = $false
 $DbUserListsGroup = $false
@@ -239,13 +305,15 @@ if ($DbGroupId -and $DbUserId) {
 
 $dbWorkspaceAssignment = $null
 if ($WorkspaceId) {
-    $dbWorkspaceAssignment = Invoke-DbRest "workspaces/$WorkspaceId/permissionassignments"
+    $dbWorkspaceAssignment = Invoke-DbRest "databricks_workspace_assignment" "workspaces/$WorkspaceId/permissionassignments"
 }
 
 # --- Build output ---
 
 $out = [ordered]@{
     collected_at = $nowIso
+    script_version = $ScriptVersion
+    errors = $CollectionErrors.ToArray()
     inputs = [ordered]@{
         tenant_id              = $TenantId
         user_upn               = $User
@@ -332,6 +400,12 @@ if ($UserIsMember -or $UserIsTransitiveMember) {
     Write-Host "    - Their browser session is stale; have them fully sign out and sign in."
     Write-Host "    - Check the recent_signins block for prior activations during this session."
 }
+if ($CollectionErrors.Count -gt 0) {
+    Write-Host ""
+    Write-Host "NOTE: $($CollectionErrors.Count) data-collection error(s) recorded in the bundle (see .errors)."
+    Write-Host "      A 'null' section may mean a failed/denied call, not a real absence."
+}
+
 Write-Host ""
 Write-Host "Full JSON saved to: $Output"
 Write-Host "Attach this file when escalating to Databricks support."
