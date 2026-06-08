@@ -75,7 +75,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.3.0"
 
 if (-not $AccountId) {
     Write-Error "-AccountId is required (or set DATABRICKS_ACCOUNT_ID)."
@@ -105,15 +105,6 @@ if ($LASTEXITCODE -ne 0) {
 Databricks CLI is not authenticated for account-level access.
   Run: databricks auth login --host $DbHost --account-id $AccountId
 "@
-}
-
-$dbTokenRaw = databricks auth token --host $DbHost 2>$null
-if ($LASTEXITCODE -ne 0 -or -not $dbTokenRaw) {
-    Write-Error "Failed to obtain Databricks account-level bearer token."
-}
-$DbToken = ($dbTokenRaw | ConvertFrom-Json).access_token
-if (-not $DbToken) {
-    Write-Error "Bearer token field missing from 'databricks auth token' output."
 }
 
 # --- Helpers ---
@@ -165,8 +156,8 @@ function Invoke-GraphAll {
     $guard = 0
     while ($next) {
         $guard++
-        if ($guard -gt 50) {
-            Add-CollectionError $Section "pagination stopped after 50 pages (possible runaway)"
+        if ($guard -gt 100) {
+            Add-CollectionError $Section "pagination stopped after 100 pages (possible runaway); with `$top=999 this is ~100k rows - result may be truncated"
             break
         }
         $errFile = New-TemporaryFile
@@ -188,22 +179,27 @@ function Invoke-GraphAll {
     return [pscustomobject]@{ value = $items.ToArray() }
 }
 
-# Databricks account REST. Invoke-RestMethod throws on HTTP 4xx/5xx; we capture
-# the status + body as a recorded error and return $null, keeping the bundle's
-# "null = no usable data, see .errors" contract consistent.
+# Databricks account REST via `databricks api get`. Reuses the CLI's own auth
+# resolution (the same path the preflight `account users list` check exercises)
+# rather than extracting a bearer token: `databricks auth token` only works with
+# U2M and is keyed by host+account-id, so it could disagree with a preflight
+# that passed via a profile / env / PAT. `api get` can't drift that way. On any
+# HTTP/transport error the CLI exits non-zero and writes detail to stderr; we
+# record it and return $null, keeping the bundle's "null = no usable data, see
+# .errors" contract consistent.
 function Invoke-DbRest {
     param([string]$Section, [string]$Path)
-    try {
-        return Invoke-RestMethod -Method GET `
-            -Uri "$DbHost/api/2.0/accounts/$AccountId/$Path" `
-            -Headers @{ Authorization = "Bearer $DbToken" } `
-            -ErrorAction Stop
-    } catch {
-        $code = $null
-        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
-        $detail = $_.ErrorDetails.Message
-        if (-not $detail) { $detail = $_.Exception.Message }
-        Add-CollectionError $Section ("HTTP $code`: $detail")
+    $errFile = New-TemporaryFile
+    $raw = databricks api get "/api/2.0/accounts/$AccountId/$Path" 2>$errFile.FullName
+    if ($LASTEXITCODE -ne 0) {
+        Add-CollectionError $Section (Get-Content $errFile.FullName -Raw)
+        Remove-Item $errFile -Force
+        return $null
+    }
+    Remove-Item $errFile -Force
+    if (-not $raw) { return $null }
+    try { return $raw | ConvertFrom-Json -Depth 20 } catch {
+        Add-CollectionError $Section "JSON parse failure"
         return $null
     }
 }
@@ -223,12 +219,19 @@ Write-Host ""
 # --- Azure side ---
 
 Write-Host "[1/9] Resolving user in Entra..."
-$userObj = Invoke-Graph "user" "users/$User`?`$select=id,userPrincipalName,displayName,mail,accountEnabled,signInActivity,onPremisesSyncEnabled"
+$userObj = Invoke-Graph "user" "users/$User`?`$select=id,userPrincipalName,displayName,mail,accountEnabled,onPremisesSyncEnabled"
 $UserOid = $userObj.id
 if (-not $UserOid) {
     Write-Error "User '$User' not found in Entra."
 }
 Write-Host "        OID: $UserOid"
+
+# signInActivity needs a privileged directory role (AuditLog.Read.All / Reports
+# Reader / etc.). If the operator lacks it, Graph returns 403 for the WHOLE user
+# object. Fetch it separately and fold it in best-effort so a missing role
+# degrades to a recorded error + null signInActivity instead of killing step 1.
+$userSignin = Invoke-Graph "user_signInActivity" "users/$UserOid`?`$select=signInActivity"
+$userObj | Add-Member -NotePropertyName signInActivity -NotePropertyValue ($userSignin.signInActivity) -Force
 
 Write-Host "[2/9] Resolving group in Entra..."
 $groupObj = Invoke-Graph "group" "groups/$GroupId`?`$select=id,displayName,description,securityEnabled,mailEnabled,onPremisesSyncEnabled,membershipRule,membershipRuleProcessingState"
@@ -236,11 +239,11 @@ $GroupName = if ($groupObj.displayName) { $groupObj.displayName } else { "unknow
 Write-Host "        Group: $GroupName"
 
 Write-Host "[3/9] Direct + transitive group memberships for user..."
-$userMemberOf = Invoke-GraphAll "user_memberOf" "users/$UserOid/memberOf`?`$select=id,displayName"
-$userTransitiveMemberOf = Invoke-GraphAll "user_transitiveMemberOf" "users/$UserOid/transitiveMemberOf`?`$select=id,displayName"
+$userMemberOf = Invoke-GraphAll "user_memberOf" "users/$UserOid/memberOf`?`$select=id,displayName&`$top=999"
+$userTransitiveMemberOf = Invoke-GraphAll "user_transitiveMemberOf" "users/$UserOid/transitiveMemberOf`?`$select=id,displayName&`$top=999"
 
 Write-Host "[4/9] Current members of suspect group..."
-$groupMembers = Invoke-GraphAll "group_members" "groups/$GroupId/members`?`$select=id,userPrincipalName,displayName"
+$groupMembers = Invoke-GraphAll "group_members" "groups/$GroupId/members`?`$select=id,userPrincipalName,displayName&`$top=999"
 $UserIsMember = [bool](($groupMembers.value | Where-Object { $_.id -eq $UserOid }).Count)
 $UserIsTransitiveMember = [bool](($userTransitiveMemberOf.value | Where-Object { $_.id -eq $GroupId }).Count)
 
