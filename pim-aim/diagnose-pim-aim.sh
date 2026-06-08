@@ -18,7 +18,7 @@ set -uo pipefail
 #     - Account group record (incl. members)
 #     - Optional workspace permission assignments
 #
-# Requires: az, databricks (>= 0.220), jq, curl
+# Requires: az, databricks (>= 0.220), jq
 #
 # Auth prerequisites (run BEFORE this script):
 #   az login --tenant <tenant-id>
@@ -32,7 +32,7 @@ WORKSPACE_ID=""
 DAYS=14
 DATABRICKS_APP_ID=""
 OUTPUT_FILE=""
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.3.0"
 
 usage() {
   cat <<EOF
@@ -87,7 +87,7 @@ fi
 
 # --- Preflight ---
 
-for tool in az databricks jq curl; do
+for tool in az databricks jq; do
   if ! command -v "$tool" &>/dev/null; then
     echo "Error: required tool '$tool' not found in PATH." >&2
     exit 1
@@ -103,12 +103,6 @@ TENANT_ID=$(az account show --query tenantId -o tsv)
 if ! databricks account users list --output json >/dev/null 2>&1; then
   echo "Error: Databricks CLI is not authenticated for account-level access." >&2
   echo "  Run: databricks auth login --host $DB_HOST --account-id $ACCOUNT_ID" >&2
-  exit 1
-fi
-
-DB_TOKEN=$(databricks auth token --host "$DB_HOST" 2>/dev/null | jq -r '.access_token // empty')
-if [[ -z "$DB_TOKEN" ]]; then
-  echo "Error: could not extract account-level bearer token from databricks CLI." >&2
   exit 1
 fi
 
@@ -149,11 +143,18 @@ graph_get() {
 graph_get_all() {
   local section="$1" url="$2" version="${3:-v1.0}"
   local next="https://graph.microsoft.com/${version}/${url}"
-  local merged='[]' page errf rc guard=0
+  local page errf rc guard=0
+  # Each page response is appended to a temp file and the pages are merged with
+  # `jq -s` at the end. We deliberately do NOT accumulate the merged array in a
+  # shell variable passed via `jq --argjson`: for large collections (e.g. a
+  # 5k-member group) that argument overflows the OS ARG_MAX and jq aborts with
+  # "Argument list too long", silently corrupting the result and the bundle.
+  # A single page (~100 rows) is small, so reading nextLink via a pipe is fine.
+  local pagesfile; pagesfile="$(mktemp)"
   while [[ -n "$next" && "$next" != "null" ]]; do
     guard=$((guard + 1))
-    if [[ "$guard" -gt 50 ]]; then
-      record_error "$section" "pagination stopped after 50 pages (possible runaway)"
+    if [[ "$guard" -gt 100 ]]; then
+      record_error "$section" "pagination stopped after 100 pages (possible runaway); with \$top=999 this is ~100k rows — result may be truncated"
       break
     fi
     rc=0; errf="$(mktemp)"
@@ -163,32 +164,36 @@ graph_get_all() {
       rm -f "$errf"; break
     fi
     rm -f "$errf"
-    merged=$(jq -n --argjson acc "$merged" --argjson pg "${page:-null}" '$acc + (($pg.value) // [])')
-    next=$(echo "$page" | jq -r '."@odata.nextLink" // empty')
+    printf '%s\n' "$page" >> "$pagesfile"
+    next=$(printf '%s' "$page" | jq -r '."@odata.nextLink" // empty')
   done
-  jq -n --argjson v "$merged" '{value: $v}'
+  # Slurp every page from the file and concatenate their .value arrays. An empty
+  # file (no pages collected) slurps to [] -> {value: []}.
+  jq -s '{value: [.[].value[]?]}' "$pagesfile"
+  rm -f "$pagesfile"
 }
 
-# Databricks account REST. curl -sS does not fail on HTTP 4xx/5xx, so we capture
-# the status code via -w and record any >=400 as an error while still returning
-# "null" for the data (keeps "null = no usable data, see .errors" consistent).
+# Databricks account REST via `databricks api get`. This deliberately reuses the
+# CLI's own auth resolution (the same path the preflight `account users list`
+# check exercises) instead of extracting a bearer token and calling curl
+# directly. `databricks auth token` only works with U2M and is keyed by
+# host+account-id, so it could disagree with a preflight that passed via a
+# profile / env / PAT. `api get` can't drift from the preflight that way.
+# On any HTTP/transport error the CLI exits non-zero and writes the detail to
+# stderr; we record it and return "null" so the run continues AND a reader can
+# tell a failed/denied call apart from a real empty result.
 dbrest() {
   local section="$1" path="$2"
-  local raw rc=0 code body
-  raw=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $DB_TOKEN" \
-    "${DB_HOST}/api/2.0/accounts/${ACCOUNT_ID}/${path}" 2>/dev/null) || rc=$?
+  local out errf rc=0
+  errf="$(mktemp)"
+  out=$(databricks api get "/api/2.0/accounts/${ACCOUNT_ID}/${path}" 2>"$errf") || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    record_error "$section" "curl transport error (rc=$rc)"
-    echo "null"; return
+    record_error "$section" "$(tr '\n' ' ' < "$errf" | cut -c1-500)"
+    rm -f "$errf"; echo "null"; return
   fi
-  code="${raw##*$'\n'}"
-  body="${raw%$'\n'*}"
-  [[ -z "$body" ]] && body="null"
-  if [[ "$code" =~ ^[0-9]+$ ]] && [[ "$code" -ge 400 ]]; then
-    record_error "$section" "HTTP $code: $(echo "$body" | tr '\n' ' ' | cut -c1-300)"
-    echo "null"; return
-  fi
-  echo "$body"
+  rm -f "$errf"
+  [[ -z "$out" ]] && out="null"
+  echo "$out"
 }
 
 # Lookback window for sign-in logs
@@ -211,7 +216,7 @@ echo ""
 # --- Azure side ---
 
 echo "[1/9] Resolving user in Entra..."
-user_obj=$(graph_get "user" "users/${USER_UPN}?\$select=id,userPrincipalName,displayName,mail,accountEnabled,signInActivity,onPremisesSyncEnabled")
+user_obj=$(graph_get "user" "users/${USER_UPN}?\$select=id,userPrincipalName,displayName,mail,accountEnabled,onPremisesSyncEnabled")
 USER_OID=$(echo "$user_obj" | jq -r '.id // empty')
 if [[ -z "$USER_OID" ]]; then
   echo "  ERROR: User '$USER_UPN' not found in Entra." >&2
@@ -219,17 +224,26 @@ if [[ -z "$USER_OID" ]]; then
 fi
 echo "        OID: $USER_OID"
 
+# signInActivity is fetched separately and folded in best-effort. It requires a
+# privileged directory role (AuditLog.Read.All / Reports Reader / etc.); if the
+# operator lacks it Graph returns 403 for the WHOLE user object. Keeping it out
+# of the core select above (which must succeed) means a missing role degrades to
+# a recorded error + null signInActivity instead of killing the run at step 1.
+user_signin=$(graph_get "user_signInActivity" "users/${USER_OID}?\$select=signInActivity")
+user_obj=$(jq -n --argjson u "$user_obj" --argjson s "${user_signin:-null}" \
+  '$u + {signInActivity: ($s.signInActivity // null)}')
+
 echo "[2/9] Resolving group in Entra..."
 group_obj=$(graph_get "group" "groups/${GROUP_ID}?\$select=id,displayName,description,securityEnabled,mailEnabled,onPremisesSyncEnabled,membershipRule,membershipRuleProcessingState")
 GROUP_NAME=$(echo "$group_obj" | jq -r '.displayName // "unknown"')
 echo "        Group: $GROUP_NAME"
 
 echo "[3/9] Direct + transitive group memberships for user..."
-user_memberOf=$(graph_get_all "user_memberOf" "users/${USER_OID}/memberOf?\$select=id,displayName")
-user_transitiveMemberOf=$(graph_get_all "user_transitiveMemberOf" "users/${USER_OID}/transitiveMemberOf?\$select=id,displayName")
+user_memberOf=$(graph_get_all "user_memberOf" "users/${USER_OID}/memberOf?\$select=id,displayName&\$top=999")
+user_transitiveMemberOf=$(graph_get_all "user_transitiveMemberOf" "users/${USER_OID}/transitiveMemberOf?\$select=id,displayName&\$top=999")
 
 echo "[4/9] Current members of suspect group..."
-group_members=$(graph_get_all "group_members" "groups/${GROUP_ID}/members?\$select=id,userPrincipalName,displayName")
+group_members=$(graph_get_all "group_members" "groups/${GROUP_ID}/members?\$select=id,userPrincipalName,displayName&\$top=999")
 USER_IS_MEMBER=$(echo "$group_members" | jq --arg uid "$USER_OID" '[.value[]? | select(.id == $uid)] | length > 0')
 
 # Also check transitively (group could be reached via nested membership)
@@ -308,6 +322,28 @@ fi
 
 ERRORS=$(jq -cs '.' "$ERR_FILE" 2>/dev/null); [[ -z "$ERRORS" ]] && ERRORS='[]'
 
+# The large Graph/SCIM sections are handed to jq via --slurpfile (read from temp
+# files), NOT --argjson. A --argjson value for a big collection (e.g. a
+# 5k-member group) overflows ARG_MAX and jq aborts with "Argument list too
+# long", which used to leave an empty output file. --slurpfile reads the file
+# directly; each file holds exactly one JSON doc, so we dereference with [0].
+# Small scalars/booleans stay as --arg/--argjson (they never overflow).
+BUNDLE_DIR="$(mktemp -d)"
+trap 'rm -f "$ERR_FILE"; rm -rf "$BUNDLE_DIR"' EXIT
+printf '%s' "${user_obj:-null}"                 > "$BUNDLE_DIR/user"
+printf '%s' "${group_obj:-null}"                > "$BUNDLE_DIR/group"
+printf '%s' "${user_memberOf:-null}"            > "$BUNDLE_DIR/memberOf"
+printf '%s' "${user_transitiveMemberOf:-null}"  > "$BUNDLE_DIR/transitiveMemberOf"
+printf '%s' "${group_members:-null}"            > "$BUNDLE_DIR/groupMembers"
+printf '%s' "${pim_eligibility:-null}"          > "$BUNDLE_DIR/pimEligibility"
+printf '%s' "${pim_assignment_schedules:-null}" > "$BUNDLE_DIR/pimAssignmentSchedules"
+printf '%s' "${pim_assignment_instances:-null}" > "$BUNDLE_DIR/pimAssignmentInstances"
+printf '%s' "${signins:-null}"                  > "$BUNDLE_DIR/signins"
+printf '%s' "${pim_audit_filtered:-null}"       > "$BUNDLE_DIR/pimAudit"
+printf '%s' "${db_user_detail:-null}"           > "$BUNDLE_DIR/dbUser"
+printf '%s' "${db_group_detail:-null}"          > "$BUNDLE_DIR/dbGroup"
+printf '%s' "${db_workspace_assignment:-null}"  > "$BUNDLE_DIR/dbWorkspaceAssignment"
+
 out=$(jq -n \
   --arg ts "$NOW_ISO" \
   --arg script_version "$SCRIPT_VERSION" \
@@ -320,24 +356,24 @@ out=$(jq -n \
   --arg account_id "$ACCOUNT_ID" \
   --arg db_user_id "$DB_USER_ID" \
   --arg db_group_id "$DB_GROUP_ID" \
-  --argjson user "$user_obj" \
-  --argjson group "$group_obj" \
-  --argjson memberOf "$user_memberOf" \
-  --argjson transitiveMemberOf "$user_transitiveMemberOf" \
-  --argjson groupMembers "$group_members" \
-  --argjson pimEligibility "$pim_eligibility" \
-  --argjson pimAssignmentSchedules "$pim_assignment_schedules" \
-  --argjson pimAssignmentInstances "$pim_assignment_instances" \
-  --argjson signins "$signins" \
-  --argjson pimAudit "$pim_audit_filtered" \
-  --argjson dbUser "$db_user_detail" \
-  --argjson dbGroup "$db_group_detail" \
-  --argjson dbWorkspaceAssignment "$db_workspace_assignment" \
-  --argjson azureUserIsMember "$USER_IS_MEMBER" \
-  --argjson azureUserIsTransitiveMember "$USER_IS_TRANSITIVE_MEMBER" \
-  --argjson activeActivation "$ACTIVE_ACTIVATION" \
-  --argjson dbUserInGroup "$DB_USER_IN_GROUP" \
-  --argjson dbUserListsGroup "$DB_USER_LISTS_GROUP" \
+  --slurpfile user "$BUNDLE_DIR/user" \
+  --slurpfile group "$BUNDLE_DIR/group" \
+  --slurpfile memberOf "$BUNDLE_DIR/memberOf" \
+  --slurpfile transitiveMemberOf "$BUNDLE_DIR/transitiveMemberOf" \
+  --slurpfile groupMembers "$BUNDLE_DIR/groupMembers" \
+  --slurpfile pimEligibility "$BUNDLE_DIR/pimEligibility" \
+  --slurpfile pimAssignmentSchedules "$BUNDLE_DIR/pimAssignmentSchedules" \
+  --slurpfile pimAssignmentInstances "$BUNDLE_DIR/pimAssignmentInstances" \
+  --slurpfile signins "$BUNDLE_DIR/signins" \
+  --slurpfile pimAudit "$BUNDLE_DIR/pimAudit" \
+  --slurpfile dbUser "$BUNDLE_DIR/dbUser" \
+  --slurpfile dbGroup "$BUNDLE_DIR/dbGroup" \
+  --slurpfile dbWorkspaceAssignment "$BUNDLE_DIR/dbWorkspaceAssignment" \
+  --argjson azureUserIsMember "${USER_IS_MEMBER:-false}" \
+  --argjson azureUserIsTransitiveMember "${USER_IS_TRANSITIVE_MEMBER:-false}" \
+  --argjson activeActivation "${ACTIVE_ACTIVATION:-false}" \
+  --argjson dbUserInGroup "${DB_USER_IN_GROUP:-false}" \
+  --argjson dbUserListsGroup "${DB_USER_LISTS_GROUP:-false}" \
   '{
     collected_at: $ts,
     script_version: $script_version,
@@ -353,21 +389,21 @@ out=$(jq -n \
       databricks_group_id: $db_group_id
     },
     azure: {
-      user: $user,
-      group: $group,
-      user_memberOf: $memberOf,
-      user_transitiveMemberOf: $transitiveMemberOf,
-      group_current_members: $groupMembers,
-      pim_eligibility_schedules: $pimEligibility,
-      pim_active_assignment_schedules: $pimAssignmentSchedules,
-      pim_active_assignment_instances: $pimAssignmentInstances,
-      recent_signins: $signins,
-      pim_audit_events: $pimAudit
+      user: $user[0],
+      group: $group[0],
+      user_memberOf: $memberOf[0],
+      user_transitiveMemberOf: $transitiveMemberOf[0],
+      group_current_members: $groupMembers[0],
+      pim_eligibility_schedules: $pimEligibility[0],
+      pim_active_assignment_schedules: $pimAssignmentSchedules[0],
+      pim_active_assignment_instances: $pimAssignmentInstances[0],
+      recent_signins: $signins[0],
+      pim_audit_events: $pimAudit[0]
     },
     databricks: {
-      user: $dbUser,
-      group: $dbGroup,
-      workspace_assignment: $dbWorkspaceAssignment
+      user: $dbUser[0],
+      group: $dbGroup[0],
+      workspace_assignment: $dbWorkspaceAssignment[0]
     },
     verdicts: {
       azure_user_is_direct_member: $azureUserIsMember,
