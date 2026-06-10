@@ -1,0 +1,5 @@
+# Local scratch / diagnostic output
+tmp/
+
+# macOS
+.DS_Store
