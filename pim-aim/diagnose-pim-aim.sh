@@ -32,7 +32,14 @@ WORKSPACE_ID=""
 DAYS=14
 DATABRICKS_APP_ID=""
 OUTPUT_FILE=""
-SCRIPT_VERSION="1.3.0"
+# Optional bearer token for Microsoft Graph. `az rest` uses the Azure CLI's
+# first-party client token, whose consented delegated scopes do NOT include the
+# PIM-for-Groups scopes (PrivilegedAccess.Read.AzureADGroup et al.) — so the PIM
+# eligibility/assignment steps [5/9][6/9] WILL fail with PermissionScopeNotGranted
+# under `az rest` no matter who is signed in. Supply a token minted WITH those
+# scopes (see --help) and every Graph call uses it via curl instead of `az rest`.
+GRAPH_TOKEN="${GRAPH_TOKEN:-}"
+SCRIPT_VERSION="1.4.0"
 
 usage() {
   cat <<EOF
@@ -51,6 +58,9 @@ Optional:
   --days <n>            Lookback window for sign-in logs (default 14)
   --databricks-app-id <id>
                         Entra Enterprise App object ID for Databricks (narrows sign-in filter)
+  --graph-token <jwt>   Bearer token for Microsoft Graph (or set GRAPH_TOKEN). REQUIRED to read
+                        PIM-for-Groups data: 'az rest' cannot acquire the PIM scopes, so without
+                        this the PIM eligibility/assignment steps fail with PermissionScopeNotGranted.
   --host <url>          Databricks accounts host (default https://accounts.azuredatabricks.net)
   --output <file>       Output JSON path (default pim-aim-diag-<timestamp>.json)
   --help
@@ -58,6 +68,18 @@ Optional:
 Preconditions:
   az login
   databricks auth login --host <accounts-host> --account-id <account-id>
+
+Reading PIM-for-Groups data (optional but needed for steps [5/9][6/9]):
+  The Azure CLI token used by 'az rest' lacks the PIM-for-Groups Graph scopes, so
+  those steps return PermissionScopeNotGranted. To collect them, mint a Graph token
+  carrying the scopes and pass it via --graph-token / GRAPH_TOKEN. For example, with
+  the Microsoft Graph PowerShell SDK:
+    Connect-MgGraph -Scopes PrivilegedAccess.Read.AzureADGroup,\\
+      PrivilegedEligibilitySchedule.Read.AzureADGroup,\\
+      PrivilegedAssignmentSchedule.Read.AzureADGroup,AuditLog.Read.All
+    (Get-MgContext) ; \$tok = [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance...
+  or any app registration / device-code flow that consents those scopes. The token's
+  identity must also hold a role (e.g. Security Reader) to read signInActivity/audit.
 EOF
   exit 0
 }
@@ -70,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --workspace-id)      WORKSPACE_ID="$2"; shift 2 ;;
     --days)              DAYS="$2"; shift 2 ;;
     --databricks-app-id) DATABRICKS_APP_ID="$2"; shift 2 ;;
+    --graph-token)       GRAPH_TOKEN="$2"; shift 2 ;;
     --host)              DB_HOST="$2"; shift 2 ;;
     --output)            OUTPUT_FILE="$2"; shift 2 ;;
     --help|-h)           usage ;;
@@ -87,7 +110,9 @@ fi
 
 # --- Preflight ---
 
-for tool in az databricks jq; do
+REQUIRED_TOOLS=(az databricks jq)
+[[ -n "$GRAPH_TOKEN" ]] && REQUIRED_TOOLS+=(curl)  # token path calls Graph via curl
+for tool in "${REQUIRED_TOOLS[@]}"; do
   if ! command -v "$tool" &>/dev/null; then
     echo "Error: required tool '$tool' not found in PATH." >&2
     exit 1
@@ -100,11 +125,26 @@ if ! az account show &>/dev/null; then
 fi
 TENANT_ID=$(az account show --query tenantId -o tsv)
 
-if ! databricks account users list --output json >/dev/null 2>&1; then
-  echo "Error: Databricks CLI is not authenticated for account-level access." >&2
-  echo "  Run: databricks auth login --host $DB_HOST --account-id $ACCOUNT_ID" >&2
+# Validate the EXACT path the data calls use, against the --account-id ARG (not
+# just the CLI profile). The old preflight ran `databricks account users list`,
+# which resolves the account-id from the auth profile and ignores --account-id —
+# so a mismatch (arg account-id != authed account, or a workspace-scoped profile)
+# passed preflight but then 404'd every dbrest call, silently emptying the whole
+# Databricks half. Hitting /accounts/${ACCOUNT_ID}/scim/v2/Users here surfaces
+# that immediately.
+db_preflight_err="$(mktemp)"
+if ! databricks api get "/api/2.0/accounts/${ACCOUNT_ID}/scim/v2/Users?count=1" >/dev/null 2>"$db_preflight_err"; then
+  echo "Error: Databricks account SCIM is not reachable for account-id ${ACCOUNT_ID}." >&2
+  echo "  Detail: $(tr '\n' ' ' < "$db_preflight_err" | cut -c1-300)" >&2
+  echo "  Likely causes:" >&2
+  echo "    - --account-id does not match the account the CLI is logged into, OR" >&2
+  echo "    - the CLI auth/host is workspace-scoped, not the account console." >&2
+  echo "  Fix: databricks auth login --host $DB_HOST --account-id $ACCOUNT_ID" >&2
+  echo "       and confirm --account-id matches that login." >&2
+  rm -f "$db_preflight_err"
   exit 1
 fi
+rm -f "$db_preflight_err"
 
 # --- Helpers ---
 
@@ -119,14 +159,36 @@ record_error() {
   jq -cn --arg s "$section" --arg d "$detail" '{section: $s, error: $d}' >> "$ERR_FILE"
 }
 
-# az rest -> Graph. On failure records the error and returns "null", so the run
-# continues AND a later reader can tell a failed/denied call apart from a real
-# empty result (which stays a populated object).
+# Graph GET. Uses a caller-supplied GRAPH_TOKEN via curl when present (the only
+# way to read PIM-for-Groups, since the `az rest` token lacks those scopes),
+# otherwise falls back to `az rest`. On failure records the error and returns
+# "null", so the run continues AND a later reader can tell a failed/denied call
+# apart from a real empty result (which stays a populated object).
+graph_call() {
+  # Single Graph GET for an absolute URL. Echoes the body; sets rc via return.
+  local full="$1" errf="$2"
+  if [[ -n "$GRAPH_TOKEN" ]]; then
+    local http body
+    body=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $GRAPH_TOKEN" \
+      -H "Accept: application/json" "$full" 2>"$errf")
+    http="${body##*$'\n'}"; body="${body%$'\n'*}"
+    if [[ ! "$http" =~ ^2 ]]; then
+      # Prefer the response body (Graph's JSON error); fall back to curl's stderr
+      # (already in errf) for transport-level failures with no body.
+      [[ -n "$body" ]] && printf '%s' "$body" > "$errf"
+      [[ ! -s "$errf" ]] && printf 'HTTP %s' "$http" > "$errf"
+      return 1
+    fi
+    printf '%s' "$body"; return 0
+  fi
+  az rest --method GET --url "$full" 2>"$errf"
+}
+
 graph_get() {
   local section="$1" url="$2" version="${3:-v1.0}"
   local out errf rc=0
   errf="$(mktemp)"
-  out=$(az rest --method GET --url "https://graph.microsoft.com/${version}/${url}" 2>"$errf") || rc=$?
+  out=$(graph_call "https://graph.microsoft.com/${version}/${url}" "$errf") || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     record_error "$section" "$(tr '\n' ' ' < "$errf" | cut -c1-500)"
     rm -f "$errf"; echo "null"; return
@@ -158,7 +220,7 @@ graph_get_all() {
       break
     fi
     rc=0; errf="$(mktemp)"
-    page=$(az rest --method GET --url "$next" 2>"$errf") || rc=$?
+    page=$(graph_call "$next" "$errf") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
       record_error "$section" "$(tr '\n' ' ' < "$errf" | cut -c1-500)"
       rm -f "$errf"; break
@@ -465,6 +527,26 @@ if [[ "$ERR_COUNT" -gt 0 ]]; then
   echo ""
   echo "NOTE: $ERR_COUNT data-collection error(s) recorded in the bundle (see .errors)."
   echo "      A 'null' section may mean a failed/denied call, not a real absence."
+fi
+
+# PIM-for-Groups scopes are not obtainable via `az rest`; surface the fix loudly
+# so an empty PIM section isn't mistaken for "no eligibility exists".
+if echo "$ERRORS" | jq -e 'any(.[]; .error | test("PermissionScopeNotGranted"))' >/dev/null 2>&1; then
+  echo ""
+  echo "!! PIM eligibility/assignment could NOT be read (PermissionScopeNotGranted)."
+  if [[ -z "$GRAPH_TOKEN" ]]; then
+    echo "   Cause: 'az rest' uses the Azure CLI token, which lacks PIM-for-Groups"
+    echo "          Graph scopes. This is structural, not a per-user permission gap."
+    echo "   Fix:   re-run with --graph-token / GRAPH_TOKEN set to a Graph token that"
+    echo "          carries PrivilegedAccess.Read.AzureADGroup,"
+    echo "          PrivilegedEligibilitySchedule.Read.AzureADGroup,"
+    echo "          PrivilegedAssignmentSchedule.Read.AzureADGroup. See --help."
+  else
+    echo "   A --graph-token was supplied but still lacks the PIM-for-Groups scopes;"
+    echo "   re-mint it with the scopes listed in --help (and admin consent if needed)."
+  fi
+  echo "   The PIM 'eligible-but-not-active' state is exactly what explains a"
+  echo "   PIM<->AIM disagreement, so this section is required for a conclusive result."
 fi
 
 echo ""

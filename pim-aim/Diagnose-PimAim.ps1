@@ -50,6 +50,17 @@
 .PARAMETER DbHost
     Databricks accounts host (default https://accounts.azuredatabricks.net).
 
+.PARAMETER GraphToken
+    Bearer token for Microsoft Graph (falls back to $env:GRAPH_TOKEN). REQUIRED to
+    read PIM-for-Groups data: 'az rest' uses the Azure CLI's first-party token, whose
+    consented scopes do NOT include the PIM-for-Groups scopes
+    (PrivilegedAccess.Read.AzureADGroup et al.), so the PIM eligibility/assignment
+    steps fail with PermissionScopeNotGranted no matter who is signed in. Mint a token
+    carrying those scopes (e.g. Connect-MgGraph -Scopes PrivilegedAccess.Read.AzureADGroup,
+    PrivilegedEligibilitySchedule.Read.AzureADGroup,
+    PrivilegedAssignmentSchedule.Read.AzureADGroup,AuditLog.Read.All) and pass it here;
+    every Graph call then uses it via Invoke-RestMethod instead of 'az rest'.
+
 .PARAMETER Output
     Output JSON path (default pim-aim-diag-<timestamp>.json).
 
@@ -71,11 +82,12 @@ param(
     [int]$Days = 14,
     [string]$DatabricksAppId,
     [string]$DbHost = "https://accounts.azuredatabricks.net",
+    [string]$GraphToken = $env:GRAPH_TOKEN,
     [string]$Output
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "1.3.0"
+$ScriptVersion = "1.4.0"
 
 if (-not $AccountId) {
     Write-Error "-AccountId is required (or set DATABRICKS_ACCOUNT_ID)."
@@ -99,13 +111,29 @@ if ($LASTEXITCODE -ne 0) {
 }
 $TenantId = (az account show --query tenantId -o tsv).Trim()
 
-$null = databricks account users list --output json 2>$null
+# Validate the EXACT path the data calls use, against the -AccountId ARG (not just
+# the CLI profile). `databricks account users list` resolves the account-id from
+# the auth profile and ignores -AccountId, so a mismatch (arg != authed account, or
+# a workspace-scoped profile) passed preflight but then 404'd every data call,
+# silently emptying the whole Databricks half. Hitting /accounts/$AccountId/... here
+# surfaces that immediately.
+$dbErrFile = New-TemporaryFile
+$null = databricks api get "/api/2.0/accounts/$AccountId/scim/v2/Users?count=1" 2>$dbErrFile.FullName
 if ($LASTEXITCODE -ne 0) {
+    $detail = (((Get-Content $dbErrFile.FullName -Raw) -replace '\s+', ' ').Trim())
+    if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) }
+    Remove-Item $dbErrFile -Force
     Write-Error @"
-Databricks CLI is not authenticated for account-level access.
-  Run: databricks auth login --host $DbHost --account-id $AccountId
+Databricks account SCIM is not reachable for account-id $AccountId.
+  Detail: $detail
+  Likely causes:
+    - -AccountId does not match the account the CLI is logged into, OR
+    - the CLI auth/host is workspace-scoped, not the account console.
+  Fix: databricks auth login --host $DbHost --account-id $AccountId
+       and confirm -AccountId matches that login.
 "@
 }
+Remove-Item $dbErrFile -Force
 
 # --- Helpers ---
 
@@ -120,6 +148,32 @@ function Add-CollectionError {
     $CollectionErrors.Add([ordered]@{ section = $Section; error = $msg }) | Out-Null
 }
 
+# Single Graph GET for an absolute URL. Uses $GraphToken via Invoke-RestMethod
+# when present (the only way to read PIM-for-Groups, since the `az rest` token
+# lacks those scopes), otherwise falls back to `az rest`. Returns the parsed
+# object, or throws with the error detail so callers can record it.
+function Invoke-GraphCall {
+    param([string]$Full)
+    if ($GraphToken) {
+        try {
+            return Invoke-RestMethod -Method Get -Uri $Full `
+                -Headers @{ Authorization = "Bearer $GraphToken"; Accept = "application/json" }
+        } catch {
+            $detail = $_.ErrorDetails.Message
+            if (-not $detail) { $detail = $_.Exception.Message }
+            throw $detail
+        }
+    }
+    $errFile = New-TemporaryFile
+    $raw = az rest --method GET --url $Full 2>$errFile.FullName
+    $rc = $LASTEXITCODE
+    $err = Get-Content $errFile.FullName -Raw
+    Remove-Item $errFile -Force
+    if ($rc -ne 0) { throw $err }
+    if (-not $raw) { return $null }
+    return $raw | ConvertFrom-Json -Depth 20
+}
+
 function Invoke-Graph {
     param(
         [string]$Section,
@@ -127,17 +181,10 @@ function Invoke-Graph {
         [string]$Version = "v1.0"
     )
     $full = "https://graph.microsoft.com/$Version/$Url"
-    $errFile = New-TemporaryFile
-    $raw = az rest --method GET --url $full 2>$errFile.FullName
-    if ($LASTEXITCODE -ne 0) {
-        Add-CollectionError $Section (Get-Content $errFile.FullName -Raw)
-        Remove-Item $errFile -Force
-        return $null
-    }
-    Remove-Item $errFile -Force
-    if (-not $raw) { return $null }
-    try { return $raw | ConvertFrom-Json -Depth 20 } catch {
-        Add-CollectionError $Section "JSON parse failure"
+    try {
+        return Invoke-GraphCall $full
+    } catch {
+        Add-CollectionError $Section ($_.Exception.Message)
         return $null
     }
 }
@@ -160,17 +207,9 @@ function Invoke-GraphAll {
             Add-CollectionError $Section "pagination stopped after 100 pages (possible runaway); with `$top=999 this is ~100k rows - result may be truncated"
             break
         }
-        $errFile = New-TemporaryFile
-        $raw = az rest --method GET --url $next 2>$errFile.FullName
-        if ($LASTEXITCODE -ne 0) {
-            Add-CollectionError $Section (Get-Content $errFile.FullName -Raw)
-            Remove-Item $errFile -Force
-            break
-        }
-        Remove-Item $errFile -Force
         $page = $null
-        try { $page = $raw | ConvertFrom-Json -Depth 20 } catch {
-            Add-CollectionError $Section "JSON parse failure"
+        try { $page = Invoke-GraphCall $next } catch {
+            Add-CollectionError $Section ($_.Exception.Message)
             break
         }
         if ($page.value) { foreach ($v in $page.value) { $items.Add($v) } }
@@ -180,7 +219,7 @@ function Invoke-GraphAll {
 }
 
 # Databricks account REST via `databricks api get`. Reuses the CLI's own auth
-# resolution (the same path the preflight `account users list` check exercises)
+# resolution (the same /accounts/$AccountId/... path the preflight now exercises)
 # rather than extracting a bearer token: `databricks auth token` only works with
 # U2M and is keyed by host+account-id, so it could disagree with a preflight
 # that passed via a profile / env / PAT. `api get` can't drift that way. On any
@@ -407,6 +446,26 @@ if ($CollectionErrors.Count -gt 0) {
     Write-Host ""
     Write-Host "NOTE: $($CollectionErrors.Count) data-collection error(s) recorded in the bundle (see .errors)."
     Write-Host "      A 'null' section may mean a failed/denied call, not a real absence."
+}
+
+# PIM-for-Groups scopes are not obtainable via `az rest`; surface the fix loudly
+# so an empty PIM section isn't mistaken for "no eligibility exists".
+if ($CollectionErrors | Where-Object { $_.error -match 'PermissionScopeNotGranted' }) {
+    Write-Host ""
+    Write-Host "!! PIM eligibility/assignment could NOT be read (PermissionScopeNotGranted)."
+    if (-not $GraphToken) {
+        Write-Host "   Cause: 'az rest' uses the Azure CLI token, which lacks PIM-for-Groups"
+        Write-Host "          Graph scopes. This is structural, not a per-user permission gap."
+        Write-Host "   Fix:   re-run with -GraphToken / GRAPH_TOKEN set to a Graph token that"
+        Write-Host "          carries PrivilegedAccess.Read.AzureADGroup,"
+        Write-Host "          PrivilegedEligibilitySchedule.Read.AzureADGroup,"
+        Write-Host "          PrivilegedAssignmentSchedule.Read.AzureADGroup. See Get-Help -Full."
+    } else {
+        Write-Host "   A -GraphToken was supplied but still lacks the PIM-for-Groups scopes;"
+        Write-Host "   re-mint it with those scopes (and admin consent if needed)."
+    }
+    Write-Host "   The PIM 'eligible-but-not-active' state is exactly what explains a"
+    Write-Host "   PIM<->AIM disagreement, so this section is required for a conclusive result."
 }
 
 Write-Host ""
